@@ -1,0 +1,119 @@
+name: Build patched RedM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      CFX_PRODUCT_NAME: redm
+      CFX_DRY_RUN: "true"
+      CFX_RETAIL_BUILD: "false"
+
+      CI: "true"
+      CI_PROJECT_DIR: ${{ github.workspace }}
+      CI_COMMIT_REF_NAME: ${{ github.ref_name }}
+      CI_COMMIT_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Force node-gyp to Python 3.11
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+
+          echo "PYTHON=$python" >> $env:GITHUB_ENV
+          echo "npm_config_python=$python" >> $env:GITHUB_ENV
+
+          python -m pip install --upgrade pip
+          python -m pip install setuptools
+
+      - name: Select installed Windows SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
+          $sdkLibRoot = Join-Path $sdkRoot 'Lib'
+          $sdkIncludeRoot = Join-Path $sdkRoot 'Include'
+
+          $sdkVersions = Get-ChildItem $sdkLibRoot -Directory |
+            Where-Object {
+              (Test-Path (Join-Path $_.FullName 'um\x64\WindowsApp.lib')) -and
+              (Test-Path (Join-Path $sdkIncludeRoot "$($_.Name)\um\Windows.h"))
+            } |
+            Sort-Object {
+              try { [version]$_.Name }
+              catch { [version]'0.0.0.0' }
+            } -Descending
+
+          $sdk = $sdkVersions | Select-Object -First 1
+
+          if (-not $sdk) {
+            throw "No usable Windows SDK was found under '$sdkRoot'."
+          }
+
+          $version = $sdk.Name
+          $include = Join-Path $sdkIncludeRoot $version
+          $lib = $sdk.FullName
+
+          "WindowsSdkDir=$sdkRoot\" >> $env:GITHUB_ENV
+          "WindowsSDKVersion=$version\" >> $env:GITHUB_ENV
+          "WindowsSdkLibVersion=$version\" >> $env:GITHUB_ENV
+          "WindowsSDKLibPath=$lib" >> $env:GITHUB_ENV
+          "WindowsSDKIncludePath=$include" >> $env:GITHUB_ENV
+          "CFX_WINDOWS_SDK=$version" >> $env:GITHUB_ENV
+
+          Write-Host "Using Windows SDK $version"
+          Write-Host "Include: $include"
+          Write-Host "Lib: $lib"
+
+      - name: Build RedM client
+        shell: pwsh
+        run: |
+          .\code\tools\ci\build_client.ps1
+
+      # data/redist/crt ships an older runtime than the runner's compiler, and code built with MSVC 14.40+ crashes on an older msvcp140 (constexpr std::mutex/condition_variable)
+      - name: Bundle matching VC++ runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsDir = & $vswhere -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $redistVersion = (Get-Content "$vsDir\VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt" | Select-Object -First 1).Trim()
+          $crtDir = Get-ChildItem "$vsDir\VC\Redist\MSVC\$redistVersion\x64" -Directory -Filter 'Microsoft.VC*.CRT' | Select-Object -First 1
+
+          if (-not $crtDir) {
+            throw "No VC++ runtime found under '$vsDir\VC\Redist\MSVC\$redistVersion\x64'."
+          }
+
+          Copy-Item -Force "$($crtDir.FullName)\*.dll" caches\fivereborn\bin\
+
+          Write-Host "Bundled VC++ runtime $redistVersion from $($crtDir.FullName)"
+          Get-ChildItem caches\fivereborn\bin\msvcp140.dll, caches\fivereborn\bin\vcruntime140.dll |
+            ForEach-Object { Write-Host "$($_.Name) $($_.VersionInfo.FileVersion)" }
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redm-client
+          include-hidden-files: true
+          path: caches/fivereborn/**
+          retention-days: 30
